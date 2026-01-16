@@ -1,0 +1,8 @@
+{
+  "name": "Serial/BLE Debug Pro",
+  "description": "A professional-grade device debugging assistant for Serial and BLE connections, featuring smart response automation and real-time monitoring.",
+  "requestFramePermissions": [
+    "serial",
+    "bluetooth"
+  ]
+}
