@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { SerialView } from './components/SerialView';
 import { SerialRightPanel } from './components/SerialRightPanel';
@@ -29,7 +29,11 @@ function App() {
   // Logs
   const [logs, setLogs] = useState<LogEntry[]>(INITIAL_LOGS);
   
-  // Serial State
+  // Serial State (Real Web Serial API)
+  const portRef = useRef<any>(null); // Holds the SerialPort object
+  const readerRef = useRef<any>(null); // Holds the stream reader
+  const keepReadingRef = useRef<boolean>(false); // Loop control
+
   const [serialConnected, setSerialConnected] = useState(false);
   const [selectedPort, setSelectedPort] = useState<string | null>(null);
   const [baudRate, setBaudRate] = useState(115200);
@@ -88,6 +92,14 @@ function App() {
     }
   }, [theme]);
 
+  // Cleanup on unmount
+  useEffect(() => {
+      return () => {
+          keepReadingRef.current = false;
+          // Note: Real serial cleanup is complex and async, hard to do perfectly in unmount
+      };
+  }, []);
+
   // Handlers
   const handleModeChange = (mode: string) => {
     if (mode === 'settings') {
@@ -114,25 +126,152 @@ function App() {
 
   const handleClearLogs = () => setLogs([]);
 
-  // --- Serial Handlers ---
-  const handleSerialSend = (data: string | Uint8Array) => {
-    if (!serialConnected) return;
-    const content = typeof data === 'string' ? data : `Hex: ${Array.from(data).map(b => b.toString(16).padStart(2,'0').toUpperCase()).join(' ')}`;
-    addLog('TX', content);
-    setSerialTx(prev => prev + (typeof data === 'string' ? data.length : data.byteLength));
+  // --- Serial Handlers (REAL WEB SERIAL API) ---
+  
+  // 1. Select Port
+  const handleSelectPort = async () => {
+    // Check API support
+    if (!('serial' in navigator)) {
+        addLog('ERR', 'Web Serial API 不被当前浏览器支持。请使用 Chrome, Edge 或 Opera。');
+        return;
+    }
+
+    try {
+        const port = await (navigator as any).serial.requestPort();
+        portRef.current = port;
+        
+        // Try to get info (Web Serial doesn't always provide friendly names like COM3)
+        const info = port.getInfo();
+        const vid = info.usbVendorId ? info.usbVendorId.toString(16).padStart(4, '0') : '????';
+        const pid = info.usbProductId ? info.usbProductId.toString(16).padStart(4, '0') : '????';
+        const name = `USB Device (VID:${vid} PID:${pid})`;
+        
+        setSelectedPort(name);
+        addLog('SYS', `已选定设备: ${name}`);
+    } catch (err: any) {
+        console.error('User cancelled or error:', err);
+        // Don't log "User cancelled" as error, it's normal flow
+        if (!err.message.includes('No port selected')) {
+             addLog('ERR', `选择设备失败: ${err.message}`);
+        }
+    }
   };
 
-  const toggleSerialConnect = () => {
+  // 2. Toggle Connect/Disconnect
+  const toggleSerialConnect = async () => {
     if (serialConnected) {
-      setSerialConnected(false);
-      addLog('SYS', 'Serial port closed');
-      setSelectedPort(null);
+      // Disconnect Logic
+      keepReadingRef.current = false;
+      if (readerRef.current) {
+          try {
+              await readerRef.current.cancel(); 
+          } catch(e) { console.error("Error cancelling reader", e); }
+      }
+      // The actual close() call happens in the readLoop's finally block
     } else {
-      setTimeout(() => {
+      // Connect Logic
+      if (!portRef.current) {
+         // If no port selected, try to select one
+         await handleSelectPort();
+         if (!portRef.current) return;
+      }
+
+      try {
+        await portRef.current.open({ 
+            baudRate,
+            dataBits,
+            stopBits,
+            parity,
+            flowControl
+        });
         setSerialConnected(true);
-        setSelectedPort('COM3');
-        addLog('SYS', `Connected to COM3 at ${baudRate} baud`);
-      }, 500);
+        addLog('SYS', `已连接到设备 (波特率: ${baudRate})`);
+        
+        // Start Reading
+        keepReadingRef.current = true;
+        readLoop();
+      } catch (err: any) {
+         addLog('ERR', `打开串口失败: ${err.message}`);
+         setSerialConnected(false);
+      }
+    }
+  };
+
+  // 3. Read Loop
+  const readLoop = async () => {
+      const decoder = new TextDecoderStream(); // Simplest approach: Text decoding. For binary, use raw reader.
+      // NOTE: For a "Pro" tool, usually we read raw Uint8Array. 
+      // Let's stick to raw reader to support Hex view properly.
+      
+      if (!portRef.current || !portRef.current.readable) return;
+
+      const reader = portRef.current.readable.getReader();
+      readerRef.current = reader;
+
+      try {
+          while (true) {
+              const { value, done } = await reader.read();
+              if (done) break; // Reader has been canceled.
+              if (value) {
+                  // value is Uint8Array
+                  handleSerialReceive(value);
+              }
+              if (!keepReadingRef.current) break;
+          }
+      } catch (error: any) {
+          addLog('ERR', `读取错误: ${error.message}`);
+      } finally {
+          reader.releaseLock();
+          // Close port
+          try {
+              await portRef.current.close();
+          } catch (e) { console.error(e); }
+          
+          setSerialConnected(false);
+          addLog('SYS', '串口已关闭');
+      }
+  };
+
+  // 4. Handle Receive
+  const handleSerialReceive = (data: Uint8Array) => {
+      // Convert for display (keeping it simple string for logs prop, but could be binary)
+      // We will convert generic Uint8Array to string representation for the log logic
+      let hexString = '';
+      for(let i=0; i<data.length; i++) {
+          hexString += String.fromCharCode(data[i]);
+      }
+      // Note: The UI SerialView handles "Hex/Ascii" toggling based on the content string.
+      // Ideally we pass the raw Uint8Array, but our addLog type expects string content usually.
+      // Let's store raw binary as string (latin1) so we don't lose bytes
+      
+      addLog('RX', hexString);
+      setSerialRx(prev => prev + data.byteLength);
+
+      // Check Rules
+      // (This is a simplified check on raw ASCII, real logic might need Hex matching)
+      if (isEngineEnabled) {
+          // ... rule matching logic would go here ...
+      }
+  };
+
+  // 5. Send
+  const handleSerialSend = async (data: string | Uint8Array) => {
+    if (!serialConnected || !portRef.current || !portRef.current.writable) {
+        addLog('ERR', '发送失败: 串口未连接');
+        return;
+    }
+    
+    try {
+        const writer = portRef.current.writable.getWriter();
+        const dataToSend = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+        await writer.write(dataToSend);
+        writer.releaseLock();
+        
+        const content = typeof data === 'string' ? data : `Hex: ${Array.from(data).map(b => b.toString(16).padStart(2,'0').toUpperCase()).join(' ')}`;
+        addLog('TX', content);
+        setSerialTx(prev => prev + dataToSend.byteLength);
+    } catch (err: any) {
+        addLog('ERR', `发送失败: ${err.message}`);
     }
   };
 
@@ -323,7 +462,7 @@ function App() {
           <SerialRightPanel 
             isConnected={serialConnected}
             selectedPort={selectedPort}
-            onSelectPort={toggleSerialConnect}
+            onSelectPort={handleSelectPort} 
             onConnectToggle={toggleSerialConnect}
             baudRate={baudRate}
             setBaudRate={setBaudRate}
